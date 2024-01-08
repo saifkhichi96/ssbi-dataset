@@ -32,7 +32,8 @@ def crop_signature(image, bbox):
     return image[y:y+h, x:x+w]
 
 
-def composite_signature(bank_check, signature, target_bbox, pen_color):
+def fill_check_field(bank_check, signature, target_bbox, pen_color,
+                     random_position=True):
     x, y, w, h = target_bbox
     x, y, w, h = int(x), int(y), int(w), int(h)
     signature_height, signature_width = signature.shape[:2]
@@ -51,11 +52,16 @@ def composite_signature(bank_check, signature, target_bbox, pen_color):
                             255, cv2.THRESH_BINARY_INV)
 
     # Random position within the target bbox
-    max_x = x + w - new_width
-    max_y = y + h - new_height
-    # Ensure there's at least one valid position
-    top_left_x = random.randint(x, max(max_x, x))
-    top_left_y = random.randint(y, max(max_y, y))
+    if random_position:
+        max_x = x + w - new_width
+        max_y = y + h - new_height
+
+        # Ensure there's at least one valid position
+        top_left_x = random.randint(x, max(max_x, x))
+        top_left_y = random.randint(y, max(max_y, y))
+    else:
+        top_left_x = x
+        top_left_y = y
 
     # Change the color of the signature
     # by replacing RGB values with the pen color
@@ -90,6 +96,12 @@ def load_dataset(dataset_dir):
     return images_path, annotations
 
 
+def select_random_annotation(annotations, class_id):
+    annotations = [ann for ann in annotations
+                   if ann['category_id'] == class_id]
+    return random.choice(annotations)
+
+
 # Load the signature dataset
 signatures_dir = 'data/forged_signatures'
 signature_images_path, signature_annotations = load_dataset(signatures_dir)
@@ -97,6 +109,10 @@ signature_images_path, signature_annotations = load_dataset(signatures_dir)
 # Load the checks dataset
 checks_dir = 'data/checks'
 checks_images_path, checks_annotations = load_dataset(checks_dir)
+
+# Load the additional text dataset
+texts_dir = 'data/additional_text'
+texts_images_path, texts_annotations = load_dataset(texts_dir)
 
 # Define the directory to save the composite images
 output_dir = 'data/forged_checks'
@@ -119,7 +135,7 @@ pens = [
 forged_checks_data = {
     'info': signature_annotations['info'],
     'licenses': signature_annotations['licenses'],
-    'categories': signature_annotations['categories'],
+    'categories': checks_annotations['categories'],
     'images': [],
     'annotations': [],
 }
@@ -149,44 +165,75 @@ for signature_file in signature_files:
             print(f'Empty signature: {signature_file}, {annotation["bbox"]}')
             continue
 
-        for bank_check_file in check_files:
+        # Select 5 random checks to composite the signature on
+        selected_checks = random.sample(check_files, 5)
+        for bank_check_file in selected_checks:
             check_info, check_anno = find_annotations_for_image(
                 bank_check_file, checks_annotations)
-            # Each check has only one annotation, i.e. the target bbox
-            target_bbox = check_anno[0]['bbox']
+            target_bboxes = {ann['category_id']: ann['bbox']
+                             for ann in check_anno}
 
-            # Load the bank check image
-            bank_check_id = bank_check_file.split('.')[0]
-            bank_check = load_image(checks_images_path, check_info)
             # Select a random pen color
             pen_color, pen_name = random.choice(pens)
 
-            signed_check = bank_check.copy()
-            signed_check, new_bbox = composite_signature(signed_check, cropped_signature,
-                                                         target_bbox, pen_color)
+            # Load the bank check image
+            bank_check_id = bank_check_file.split('.')[0]
+            filled_check = load_image(checks_images_path, check_info)
 
-            # Add the new image and annotation to the new dataset
-            new_annotation = annotation.copy()
-            new_annotation['id'] = new_id
-            new_annotation['image_id'] = new_id
-            new_annotation['bbox'] = new_bbox
-            new_annotation['area'] = new_bbox[2] * new_bbox[3]
-            new_annotation['ink_color'] = pen_color
-            new_annotation['ink_name'] = pen_name
-            forged_checks_annotations.append(new_annotation)
+            # Composite the signature and other text on the check
+            for cat_id, target_bbox in target_bboxes.items():
+                # Each check has only one annotation, i.e. the target bbox
+                target_bbox = target_bboxes[cat_id]
+
+                # Fill the check with the signature
+                if cat_id == 1: # bank check
+                    filled_check, new_bbox = fill_check_field(filled_check, cropped_signature,
+                                                                 target_bbox, pen_color)
+
+                # Fill the check with the additional text
+                else: # additional text
+                    # Load a random text image
+                    text_image = random.choice([img['file_name'] for img in texts_annotations['images']])
+                    text_info, current_text_annotations = find_annotations_for_image(
+                        text_image, texts_annotations)
+                    text_image = load_image(texts_images_path, text_info)
+
+                    # Select random text to add to the check
+                    text_annotation = select_random_annotation(current_text_annotations, class_id=cat_id)
+                    
+                    # Crop the text from the text image
+                    text_bbox = text_annotation['bbox']
+                    text = crop_signature(text_image, text_bbox)
+
+                    # Composite the text on the check
+                    filled_check, new_bbox = fill_check_field(filled_check, text,
+                                                                 target_bbox, pen_color,
+                                                                 random_position=False)
+                    
+
+                # Add the new image and annotation to the new dataset
+                new_annotation = annotation.copy()
+                new_annotation['id'] = len(forged_checks_annotations) + 1
+                new_annotation['image_id'] = new_id
+                new_annotation['category_id'] = cat_id
+                new_annotation['bbox'] = new_bbox
+                new_annotation['area'] = new_bbox[2] * new_bbox[3]
+                new_annotation['attributes']['ink_color'] = pen_color
+                new_annotation['attributes']['ink_name'] = pen_name
+                forged_checks_annotations.append(new_annotation)
 
             # Add the new image info to the new dataset
             new_image_name = f'{bank_check_id}_{signature_id}_{i}.jpg'
             new_image_info = image_info.copy()
             new_image_info['id'] = new_id
             new_image_info['file_name'] = new_image_name
-            new_image_info['width'] = signed_check.shape[1]
-            new_image_info['height'] = signed_check.shape[0]
+            new_image_info['width'] = filled_check.shape[1]
+            new_image_info['height'] = filled_check.shape[0]
             forged_checks_images.append(new_image_info)
             new_id += 1
 
             # Save the new image
-            cv2.imwrite(f'{output_images_path}/{new_image_name}', signed_check)
+            cv2.imwrite(f'{output_images_path}/{new_image_name}', filled_check)
 
 forged_checks_data['images'] = forged_checks_images
 forged_checks_data['annotations'] = forged_checks_annotations
